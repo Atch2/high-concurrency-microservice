@@ -1,0 +1,396 @@
+openapi: 3.0.3
+info:
+  title: ATCH - Microservicio de Transferencias Bancarias
+  description: |
+    API REST para gestión de transferencias bancarias con alta concurrencia.
+    
+    **Características principales:**
+    - Transferencias idempotentes entre cuentas
+    - Concurrencia segura con prevención de deadlocks
+    - Gestión de balances en tiempo real
+    - Reinicio del sistema para pruebas de carga
+    
+    **Arquitectura:**
+    - Patrón Hexagonal (Puertos y Adaptadores)
+    - BigDecimal para precisión monetaria
+    - ReentrantLock para concurrencia segura
+    - ConcurrentHashMap para almacenamiento thread-safe
+  version: 1.0.0
+  contact:
+    name: Santiago Mosquera
+    email: developer@jakaysa.com
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+
+servers:
+  - url: http://localhost:8080
+    description: Servidor de desarrollo local
+  - url: http://api:8080
+    description: Servidor Docker interno
+
+tags:
+  - name: Health
+    description: Endpoints de salud del sistema
+  - name: Transfers
+    description: Operaciones de transferencias bancarias
+  - name: Balances
+    description: Consulta de balances de cuentas
+  - name: System
+    description: Operaciones del sistema (reset, configuración)
+
+paths:
+  /health:
+    get:
+      tags:
+        - Health
+      summary: Verificar estado del servicio
+      description: Endpoint simple para verificar que el servicio está funcionando correctamente.
+      operationId: healthCheck
+      responses:
+        '200':
+          description: Servicio funcionando correctamente
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: "ok"
+
+  /reset:
+    post:
+      tags:
+        - System
+      summary: Reiniciar el ledger
+      description: |
+        Reinicia completamente el sistema creando nuevas cuentas con balances iniciales.
+        
+        **Uso típico:**
+        - Preparación para pruebas de carga
+        - Limpieza del estado del sistema
+        - Configuración inicial de cuentas
+      operationId: resetLedger
+      requestBody:
+        description: |
+          Configuración para el reinicio del ledger.
+          Si no se proporciona, usa valores por defecto (100 cuentas con 1000 de balance inicial).
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResetRequest'
+            examples:
+              default:
+                summary: Configuración por defecto
+                value:
+                  accounts: 100
+                  initialBalance: 1000
+              k6_test:
+                summary: Configuración para pruebas K6
+                value:
+                  accounts: 200
+                  initialBalance: 1000
+              small_test:
+                summary: Prueba pequeña
+                value:
+                  accounts: 10
+                  initialBalance: 500
+      responses:
+        '200':
+          description: Ledger reiniciado exitosamente
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                    example: true
+        '400':
+          description: Datos de entrada inválidos
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                    example: false
+        '500':
+          description: Error interno del servidor
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                    example: false
+
+  /balances:
+    get:
+      tags:
+        - Balances
+      summary: Obtener balances de todas las cuentas
+      description: |
+        Retorna un snapshot de los balances actuales de todas las cuentas en el sistema.
+        
+        **Características:**
+        - Thread-safe: Snapshot consistente en el momento de la consulta
+        - Performance optimizada: Sin bloqueos para lectura
+        - Formato: Mapa con ID de cuenta como clave y balance como valor
+      operationId: getBalances
+      responses:
+        '200':
+          description: Balances obtenidos exitosamente
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  type: number
+                  format: decimal
+                  description: Balance de la cuenta
+                example:
+                  "A0": 1250.50
+                  "A1": 875.25
+                  "A2": 1100.00
+                  "A3": 950.75
+        '500':
+          description: Error interno del servidor
+
+  /transfer:
+    post:
+      tags:
+        - Transfers
+      summary: Realizar transferencia entre cuentas
+      description: |
+        Transfiere dinero de una cuenta a otra de forma segura e idempotente.
+        
+        **Características de seguridad:**
+        - **Idempotencia**: La misma clave (`key`) no puede procesar dos veces
+        - **Concurrencia segura**: Sin condiciones de carrera ni deadlocks
+        - **Validaciones**: Fondos suficientes, cuentas existentes, datos válidos
+        - **Atomicidad**: La operación es todo-o-nada
+        
+        **Performance:**
+        - Locks granulares por cuenta (no lock global)
+        - Verificación doble de idempotencia optimizada
+        - Medición de latencia incluida en la respuesta
+      operationId: transferMoney
+      requestBody:
+        description: Datos de la transferencia a realizar
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TransferRequest'
+            examples:
+              simple_transfer:
+                summary: Transferencia simple
+                value:
+                  from: "A0"
+                  to: "A1"
+                  amount: 100.50
+                  key: "transfer-001-20241201"
+              k6_transfer:
+                summary: Transferencia tipo K6
+                value:
+                  from: "A15"
+                  to: "A42"
+                  amount: 5
+                  key: "key_1_342"
+              idempotent_retry:
+                summary: Reintento idempotente
+                description: La misma key no procesará dos veces
+                value:
+                  from: "A5"
+                  to: "A10"
+                  amount: 250
+                  key: "retry-same-key-123"
+      responses:
+        '200':
+          description: Transferencia realizada exitosamente
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransferResponse'
+              example:
+                ok: true
+                tookMs: 45
+        '400':
+          description: |
+            Error en los datos de entrada o reglas de negocio:
+            - Datos faltantes o inválidos
+            - Fondos insuficientes en la cuenta origen
+            - Cuenta origen y destino iguales
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                bad_request:
+                  summary: Datos inválidos
+                  value:
+                    error: "bad request"
+                insufficient_funds:
+                  summary: Fondos insuficientes
+                  value:
+                    error: "insufficient funds"
+                same_account:
+                  summary: Misma cuenta origen y destino
+                  value:
+                    error: "Las cuentas de origen y destino no pueden ser iguales"
+        '404':
+          description: Una o ambas cuentas no existen
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error: "unknown account"
+        '500':
+          description: Error interno del servidor
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error: "transfer failed"
+
+components:
+  schemas:
+    ResetRequest:
+      type: object
+      description: Configuración para reinicializar el ledger
+      properties:
+        accounts:
+          type: integer
+          description: Número de cuentas a crear
+          minimum: 1
+          maximum: 10000
+          default: 100
+          example: 200
+        initialBalance:
+          type: number
+          format: decimal
+          description: Balance inicial para cada cuenta
+          minimum: 0
+          default: 1000
+          example: 1000
+      example:
+        accounts: 200
+        initialBalance: 1000
+
+    TransferRequest:
+      type: object
+      required:
+        - from
+        - to
+        - amount
+        - key
+      description: Datos necesarios para realizar una transferencia
+      properties:
+        from:
+          type: string
+          description: ID de la cuenta origen
+          pattern: '^A\d+$'
+          example: "A0"
+        to:
+          type: string
+          description: ID de la cuenta destino
+          pattern: '^A\d+$'
+          example: "A1"
+        amount:
+          type: number
+          format: decimal
+          description: Monto a transferir (debe ser positivo)
+          minimum: 0.01
+          example: 100.50
+        key:
+          type: string
+          description: |
+            Clave de idempotencia única. 
+            Garantiza que la misma transferencia no se procese dos veces.
+          minLength: 1
+          maxLength: 255
+          example: "transfer-001-20241201"
+      example:
+        from: "A0"
+        to: "A1"
+        amount: 100.50
+        key: "transfer-001-20241201"
+
+    TransferResponse:
+      type: object
+      required:
+        - ok
+        - tookMs
+      description: Respuesta de una transferencia exitosa
+      properties:
+        ok:
+          type: boolean
+          description: Indica si la transferencia fue exitosa
+          example: true
+        tookMs:
+          type: integer
+          format: int64
+          description: Tiempo que tomó procesar la transferencia en milisegundos
+          minimum: 0
+          example: 45
+      example:
+        ok: true
+        tookMs: 45
+
+    ErrorResponse:
+      type: object
+      required:
+        - error
+      description: Respuesta de error estándar
+      properties:
+        error:
+          type: string
+          description: Mensaje descriptivo del error
+          example: "insufficient funds"
+      example:
+        error: "insufficient funds"
+
+    BalancesResponse:
+      type: object
+      description: |
+        Mapa de balances donde la clave es el ID de la cuenta 
+        y el valor es el balance actual
+      additionalProperties:
+        type: number
+        format: decimal
+      example:
+        "A0": 1250.50
+        "A1": 875.25
+        "A2": 1100.00
+
+  examples:
+    TransferExamples:
+      K6StyleTransfer:
+        summary: Transferencia estilo K6
+        description: Formato típico usado en pruebas de carga K6
+        value:
+          from: "A15"
+          to: "A42" 
+          amount: 5
+          key: "key_1_342"
+      
+      IdempotentRetry:
+        summary: Reintento idempotente
+        description: |
+          Usar la misma key para reintentos.
+          La segunda llamada será ignorada automáticamente.
+        value:
+          from: "A5"
+          to: "A10"
+          amount: 250
+          key: "unique-operation-123"
+
+security: []
+
+externalDocs:
+  description: Documentación técnica detallada
+  url: https://github.com/jakaysa/atch/blob/main/DECISIONES.md
